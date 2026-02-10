@@ -1,0 +1,13 @@
+To demo the code, we have provided a Jupyter notebook: ExampleCode. In addition to this notebook, download the three csv files: FP5_OQ1_EZM_Test_Pho.csv, FP5_OQ1_OpenArea.csv and Test_Video_dual_opto_shock_eYFP_m5_recall-006DLC_resnet50_engram_round2_front_fcApr21shuffle1_400000.csv. These files are real data obtained during a fiber photometry session as a mouse explored the elevated zero maze.
+
+The first file is the fiber photometry signal, with Timestamps, and the signal from each brain region and cell type. The LedState 4 corresponds to 560nm, 2 corresponds to 470nm, and 1 corresponds to 415nm wavelengths. The interpolated signals for each brain region are in the next four columns. Neuronal signal for the mPFC and vHPC correspond to Region 0R and 1R, respectively, with the LedState 4. Astrocyte signal for the mPFC and vHPC correspond to Region 2G and 3G, respectively, with the LedState 2. Isosbestic for each region/celltype signal is in LedState1.
+
+The second file is the behavioral output. Due to the inherited structure of the previous code (for a prior publication in our lab), columns corresponding to each behavior was changed to the necessary names for the code execution. Therefore, "Freezing" of 1 corresponds to open area for elevated zero maze, and "Not Freezing" of 1 corresponds to closed area for elevated zero maze.
+
+The third file is again inherited from the structure of the previous code, and is just needed to be present in the path denoted "dlc_file" when calling fp.FiberPhotometryCurve. It does not correspond to actual data obtained for this project.
+
+For ETA analysis (multi_event_eta), due to numpy's indexing structure, open area onsets are coded as freeze_offsets and closed area onsets are freeze_onsets (counterintuitive unfortunately, but verified).
+
+Any mention of other animals/events in the jupyter notebook can be deleted.
+
+This code runs optimally with parallel processors, and should take less than 5 minutes to run for a single mouse.

@@ -16,6 +16,8 @@ from photonsoup.anymaze_analysis import anymazeResults
 from photonsoup.dlc_analysis import dlcResults
 from photonsoup.b_spline import BSpline
 from joblib import Parallel, delayed
+from typing import Union
+from scipy.signal import savgol_filter
 
 __all__ = ["FiberPhotometryCurve", "FiberPhotometryCollection"]
 
@@ -26,12 +28,15 @@ class FiberPhotometryCurve:
                  dlc_file: str = None,
                  offset: float = None,
                  anymaze_file: str = None,
-                 regress: bool = True,
+                 regress: Union[bool, list, dict] = True,
                  ID: str = None,
                  task: str = None,
                  treatment: str = None,
                  smoother='kalman',
-                 batch=True):
+                 batch=True,
+                 outliers=False,
+                outlier_window=10,
+                outlier_threshold=10):
         """
         """
         # these should always be present
@@ -45,7 +50,19 @@ class FiberPhotometryCurve:
         self.treatment = treatment
         self.anymaze_file = anymaze_file
         self.dlc_file = dlc_file
-        self.regress = regress
+        if isinstance(regress, dict):
+            self.regress_map = regress
+            self.regress = list(regress.keys())
+        elif isinstance(regress, list):
+            self.regress_map = {}
+            self.regress = regress
+        elif isinstance(regress, bool):
+            self.regress_map = {}
+            self.regress = regress
+        else:
+            self.regress_map = {}
+            self.regress = False
+
         self.smoother = smoother
         self.batch = batch
         self.dff_signals = None
@@ -56,6 +73,9 @@ class FiberPhotometryCurve:
         self.dlc_results = None
         self.interp = None
         self.splines = None
+        self.outliers = outliers
+        self.outlier_window = outlier_window
+        self.outlier_threshold = outlier_threshold
 
         if offset is None:
             self.offset = 0
@@ -76,6 +96,8 @@ class FiberPhotometryCurve:
             self.dff_signals, self.dfz_signals = self._process_data()
             self.region_peak_properties = self.find_signal()
             self.neg_region_peak_properties = self.find_signal(neg=True)
+
+          # Dictionary to store additional Anymaze behaviors
 
     def __iter__(self):
         return iter(list(self.dff_signals.values()))
@@ -98,61 +120,139 @@ class FiberPhotometryCurve:
     def __getitem__(self, idx):
         return self.dff_signals[idx]
 
+
+    # def _extract_data(self):
+    #     """_summary_
+    #     """
+    #     # Initialize the data structures
+    #     raw_signal = {}
+    #     isobestic_data = {}
+    #     timestamps = {}
+    #
+    #     # Get the unique values in the "LedState" column
+    #     led_states_unique = self.fp_df['LedState'].unique()
+    #
+    #     # Filter out any invalid values (if present)
+    #     led_state = [state for state in led_states_unique if state in [1, 2, 4]]
+    #
+    #     # Get the unique region columns
+    #     region_columns = self.fp_df.columns[self.fp_df.columns.str.contains('Region')].tolist()
+    #
+    #     # Exclude data before offset
+    #     self.fp_df = self.fp_df[self.fp_df['Timestamp'] >= self.offset].reset_index(drop=True)
+    #
+    #     # creat new initial time variable for later correction
+    #     temp_t0 = self.fp_df.loc[0, 'Timestamp']
+    #
+    #     # Find the length of the shortest trace
+    #     shortest_trace_length = float('inf')
+    #
+    #     # Process each region column
+    #     for column in region_columns:
+    #
+    #         # Filter the data based on LEDState and Region column
+    #         region_data = self.fp_df[
+    #             (self.fp_df['LedState'] == 2) if column.endswith('G') else (self.fp_df['LedState'] == 4)]
+    #
+    #         # Store the region-specific information
+    #         if not region_data.empty:
+    #             raw_signal[column] = region_data[column].reset_index(drop=True)
+    #             isobestic_data[column] = self.fp_df[self.fp_df['LedState'] == 1][column].reset_index(drop=True)
+    #
+    #             # Update the length of the shortest trace
+    #             shortest_trace_length = min(shortest_trace_length, len(region_data[column]),
+    #                                         len(self.fp_df[self.fp_df['LedState'] == 1][column]))
+    #
+    #     for state in led_state:
+    #         if not self.fp_df[self.fp_df['LedState'] == state].Timestamp.empty:
+    #             # Store the de-interleaved timestamps for the LEDState
+    #             timestamps[str(state)] = self.fp_df[self.fp_df['LedState'] == state].Timestamp.reset_index(
+    #                 drop=True) - temp_t0
+    #
+    #     # Trim the signals and timestamps to the length of the shortest trace
+    #     for column in raw_signal.keys():
+    #         raw_signal[column] = raw_signal[column][:shortest_trace_length]
+    #
+    #     for column in isobestic_data.keys():
+    #         isobestic_data[column] = isobestic_data[column][:shortest_trace_length]
+    #
+    #     for state in led_state:
+    #         timestamps[str(state)] = timestamps[str(state)][:shortest_trace_length]
+    #
+    #     self.raw_signal = raw_signal
+    #     self.isobestic_channel = isobestic_data
+    #     self.Timestamps = timestamps
+    #     return
+    @staticmethod
+    def detect_impulse_outliers(trace, window=5, threshold=5):
+        padded = np.pad(trace, (window, window), mode='edge')
+        rolling_median = np.array([
+            np.median(padded[i:i + 2 * window + 1]) for i in range(len(trace))
+        ])
+        diff = np.abs(trace - rolling_median)
+        mad = np.median(np.abs(diff - np.median(diff)))
+        return diff > threshold * mad
+
+    @staticmethod
+    def replace_outliers_with_interp(trace, outlier_mask):
+        trace_clean = trace.copy()
+        trace_clean[outlier_mask] = np.nan
+        return pd.Series(trace_clean).interpolate(method='linear', limit_direction='both').values
+
+    @staticmethod
+    def clean_photometry_trace(trace, window=30, threshold=10):
+        outliers = FiberPhotometryCurve.detect_impulse_outliers(trace, window, threshold)
+        return FiberPhotometryCurve.replace_outliers_with_interp(trace, outliers)
+
     def _extract_data(self):
-        """_summary_
-        """
-        # Initialize the data structures
+        """Extracts and optionally cleans raw and isobestic signals."""
         raw_signal = {}
         isobestic_data = {}
         timestamps = {}
 
-        # Get the unique values in the "LedState" column
         led_states_unique = self.fp_df['LedState'].unique()
-
-        # Filter out any invalid values (if present)
         led_state = [state for state in led_states_unique if state in [1, 2, 4]]
 
-        # Get the unique region columns
         region_columns = self.fp_df.columns[self.fp_df.columns.str.contains('Region')].tolist()
 
-        # Exclude data before offset
+        # Offset and re-time
         self.fp_df = self.fp_df[self.fp_df['Timestamp'] >= self.offset].reset_index(drop=True)
-
-        # creat new initial time variable for later correction
         temp_t0 = self.fp_df.loc[0, 'Timestamp']
-
-        # Find the length of the shortest trace
         shortest_trace_length = float('inf')
 
-        # Process each region column
         for column in region_columns:
+            is_gfp = column.endswith('G')
+            led_val = 2 if is_gfp else 4
+            region_data = self.fp_df[self.fp_df['LedState'] == led_val]
 
-            # Filter the data based on LEDState and Region column
-            region_data = self.fp_df[
-                (self.fp_df['LedState'] == 2) if column.endswith('G') else (self.fp_df['LedState'] == 4)]
-
-            # Store the region-specific information
             if not region_data.empty:
-                raw_signal[column] = region_data[column].reset_index(drop=True)
-                isobestic_data[column] = self.fp_df[self.fp_df['LedState'] == 1][column].reset_index(drop=True)
+                raw = region_data[column].reset_index(drop=True).astype(float)
+                iso = self.fp_df[self.fp_df['LedState'] == 1][column].reset_index(drop=True).astype(float)
 
-                # Update the length of the shortest trace
-                shortest_trace_length = min(shortest_trace_length, len(region_data[column]),
-                                            len(self.fp_df[self.fp_df['LedState'] == 1][column]))
+                # Conditionally clean
+                if self.outliers:
+                    if column == 'Region3G':
+                        raw = self.clean_photometry_trace(raw, self.outlier_window, self.outlier_threshold)
+                        iso = self.clean_photometry_trace(iso, self.outlier_window, self.outlier_threshold)
+                    elif column == 'Region2G':
+                        raw = self.clean_photometry_trace(raw, self.outlier_window, self.outlier_threshold)
+                        iso = self.clean_photometry_trace(iso, self.outlier_window, self.outlier_threshold)
 
+                raw_signal[column] = raw
+                isobestic_data[column] = iso
+                shortest_trace_length = min(shortest_trace_length, len(raw), len(iso))
+
+        # Timestamps
         for state in led_state:
             if not self.fp_df[self.fp_df['LedState'] == state].Timestamp.empty:
-                # Store the de-interleaved timestamps for the LEDState
                 timestamps[str(state)] = self.fp_df[self.fp_df['LedState'] == state].Timestamp.reset_index(
                     drop=True) - temp_t0
 
-        # Trim the signals and timestamps to the length of the shortest trace
-        for column in raw_signal.keys():
+        # Trim all to equal length
+        for column in raw_signal:
             raw_signal[column] = raw_signal[column][:shortest_trace_length]
-
-        for column in isobestic_data.keys():
+        for column in isobestic_data:
             isobestic_data[column] = isobestic_data[column][:shortest_trace_length]
-
         for state in led_state:
             timestamps[str(state)] = timestamps[str(state)][:shortest_trace_length]
 
@@ -160,7 +260,6 @@ class FiberPhotometryCurve:
         self.isobestic_channel = isobestic_data
         self.Timestamps = timestamps
         return
-
     @staticmethod
     @nb.jit(nopython=True)
     def __arrays_equal__(a, b):
@@ -206,6 +305,7 @@ class FiberPhotometryCurve:
         :return: df/f standard or z-scored
         Function to calculate DF/F (signal - median / median or standard deviation).
         """
+        # raw += 1
         if method == "standard":
             F0 = np.median(raw)  # median value of time series
             df_f = (raw - F0) / F0
@@ -218,6 +318,7 @@ class FiberPhotometryCurve:
         return df_f
 
     @staticmethod
+
     def _fit_regression(endog, exog, summary=False):
         """_summary_
 
@@ -229,7 +330,8 @@ class FiberPhotometryCurve:
         Returns:
             _type_: _description_
         """
-        model = sm.OLS(endog, sm.add_constant(exog)).fit()
+        #model = sm.OLS(endog, sm.add_constant(exog)).fit()
+        model = sm.RLM(endog, sm.add_constant(exog),M=sm.robust.norms.HuberT()).fit()
         if summary:
             print(model.summary())
         return model.resid
@@ -283,9 +385,18 @@ class FiberPhotometryCurve:
         dfz_signal = {}
 
         for key in self.raw_signal.keys():
-            # get the timeseries
+            # get the target region signal
             region_timeseries = self.raw_signal[key]
-            isobestic_timeseries = self.isobestic_channel[key]
+
+            # determine isosbestic reference: mapped or default
+            if hasattr(self, 'regress_map') and isinstance(self.regress_map, dict) and key in self.regress_map:
+                ref_key = self.regress_map[key]
+                if ref_key not in self.isobestic_channel:
+                    raise KeyError(f"Isosbestic reference '{ref_key}' for region '{key}' not found.")
+            else:
+                ref_key = key
+
+            isobestic_timeseries = self.isobestic_channel[ref_key]
 
             # Perform baseline correction
             region_timeseries_corrected = self._als_detrend(region_timeseries)
@@ -306,18 +417,27 @@ class FiberPhotometryCurve:
             isobestic_timeseries_corrected_z = self._df_f(isobestic_timeseries_corrected, method="z_scored")
 
             # Regress out the isobestic signal from the region signal
-            if self.regress is True:
+            # if self.regress is True:
+            #     region_timeseries_corrected = self._fit_regression(region_timeseries_corrected,
+            #                                                        isobestic_timeseries_corrected)
+            #     region_timeseries_corrected_z = self._fit_regression(region_timeseries_corrected_z,
+            #                                                          isobestic_timeseries_corrected_z)
+            should_regress = (
+                    self.regress is True or
+                    (isinstance(self.regress, list) and key in self.regress)
+            )
+
+            if should_regress:
                 region_timeseries_corrected = self._fit_regression(region_timeseries_corrected,
                                                                    isobestic_timeseries_corrected)
                 region_timeseries_corrected_z = self._fit_regression(region_timeseries_corrected_z,
                                                                      isobestic_timeseries_corrected_z)
-
             dff_signal[key] = region_timeseries_corrected
             dfz_signal[key] = region_timeseries_corrected_z
 
         return dff_signal, dfz_signal
 
-    def _process_behavioral_data_batch(self, bin_duration=60, start=0, end=None):
+    def _process_behavioral_data_batch(self, bin_duration=360, start=0, end=None):
         anymaze_results = anymazeResults(self.anymaze_file)
         anymaze_results.correct_time_warp(self.__TN__)
         percent_freezing = anymaze_results.calculate_binned_freezing(bin_duration=bin_duration, start=start, end=end,
@@ -372,8 +492,9 @@ class FiberPhotometryCurve:
 
         for region, sig in self.dff_signals.items():
             signal = -sig if neg else sig
-            peaks, properties = find_peaks(signal, height=np.std(signal), prominence=2 * np.std(signal), width=(7, 150),
-                                           rel_height=0.5)
+            peaks, properties = find_peaks(signal, height=np.std(signal), prominence=2 * np.std(signal), width=(15, 500),rel_height=0.5)
+            # peaks, properties = find_peaks(signal, height=1, prominence=2, width=(15, 500),
+            #                                rel_height=0.5)
             properties['peaks'] = peaks
             properties['areas_under_curve'] = self.calc_area([int(x) for x in properties['left_ips']],
                                                              [int(x) for x in properties['right_ips']],
@@ -382,6 +503,7 @@ class FiberPhotometryCurve:
             region_peak_properties[region] = properties
 
         return region_peak_properties
+
 
     def visual_check_peaks(self, signal):
         """
@@ -461,7 +583,7 @@ class FiberPhotometryCollection:
             else:
                 self.curves.update({arg.ID: arg})
 
-    def curve_array(self, task, treatment, region, kind="f"):
+    def curve_array(self, task, treatment, region, kind="z"):
         curves = self[task, treatment]
         min_len = np.min([len(curve[region]) for curve in curves])
         curve_array = np.zeros(shape=(len(curves), min_len))
@@ -632,13 +754,32 @@ class FiberPhotometryCollection:
         start_indices = np.where(true_deflects == sig_duration)[0]
         return start_indices
 
-    def plot_whole_eta(self, task, treatment, region, trial_len=360, ci='tci', sig_duration=8, ax=None, a=0.05,
-                       **kwargs):
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-        # create array of curves
-        curves = self.curve_array(task, treatment, region)
+    def plot_whole_eta(self, task, treatment, region, trial_len=360, ci='tci',
+                       sig_duration=8, ax=None, kind='z', a=0.05,
+                       frame_rate=30, duration_sec=60, **kwargs):
+        """
+        Plot the average signal and confidence interval across trials, limited to a set duration.
 
-        # choose t-confidence interval or bootstrapped
+        Parameters:
+        - task, treatment, region: Inputs to self.curve_array()
+        - trial_len: Total trial duration (used only for axis scaling if not trimming)
+        - ci: 'tci' for t-based confidence interval, 'bci' for bootstrap
+        - sig_duration: Minimum duration (in frames) of significance
+        - ax: Optional matplotlib Axes object
+        - kind: Which signal kind to extract
+        - a: Significance level (alpha)
+        - frame_rate: Sampling rate in Hz (default 30 Hz)
+        - duration_sec: How many seconds of data to display (default 60s)
+        - kwargs: Additional plot keyword arguments
+        """
+
+        # Create array of curves
+        curves = self.curve_array(task, treatment, region, kind)
+
+        # Compute confidence interval
         confidence_level = 1 - a
         if ci == 'tci':
             c_int = self.tci(curves, confidence_level)
@@ -647,29 +788,40 @@ class FiberPhotometryCollection:
         else:
             raise ValueError("Confidence interval options are 'tci' or 'bci'")
 
-        # find significant indices
-        start_indices = self.eta_significance(c_int, sig_duration=8)  # change to be dependent on the sampling rate
+        # Limit to the first `duration_sec` seconds based on the frame rate
+        max_index = frame_rate * duration_sec
+        curves = curves[:, :max_index]
+        c_int = c_int[:, :max_index]
+        trial_len = duration_sec  # Adjust time axis accordingly
 
-        # create figure
+        # Identify significant intervals
+        start_indices = self.eta_significance(c_int, sig_duration=sig_duration)
+
+        # Create figure if not provided
         if ax is None:
             fig, ax = plt.subplots()
 
-        # create time
-        time = np.linspace(0, trial_len, len(curves.T))
+        # Time vector
+        time = np.linspace(0, trial_len, curves.shape[1])
 
+        # Plot average trace
         ax.plot(time, np.average(curves, axis=0), **kwargs)
+
+        # Plot confidence interval band
         ax.fill_between(time, c_int[0, :], c_int[1, :], alpha=0.3)
-        # plot the significant deflections
+
+        # Plot significant intervals as red horizontal lines
         y_height = ax.get_ylim()[1] * 0.97
         for start_index in start_indices:
             end_index = start_index + sig_duration
             try:
                 ax.hlines(y=y_height, xmin=time[start_index], xmax=time[end_index], colors='r')
             except IndexError:
-                end_index = len(time) - 1  # set end_index to the last valid index
+                end_index = len(time) - 1
                 print(f"Warning: Adjusted end index to {end_index} due to out-of-bounds error.")
                 ax.hlines(y=y_height, xmin=time[start_index], xmax=time[end_index], colors='r')
 
+        # Return figure and axis
         if ax is None:
             return fig, ax
         else:
@@ -678,7 +830,7 @@ class FiberPhotometryCollection:
     def multi_event_eta(self, task, treatment, region, events=None, window=3, ci='tci', sig_duration=8, a=0.05, ax=None,
                         **kwargs):
         # window in seconds times 30 indices per second and half the window period to visualize before
-        number_of_indices = int(window * 1.5 * 15)
+        number_of_indices = int(window * 1.5 * 30)
 
         # determine if we need timestamps for green or red indicator
         time_idx = "2" if "G" in region else "4"
@@ -724,8 +876,13 @@ class FiberPhotometryCollection:
         if ax is None:
             fig, ax = plt.subplots()
         time = np.linspace(-window / 2, window, number_of_indices)
+        fill_color = kwargs.pop('fill_color', 'blue')  # Default color is 'blue'
+        opacity = kwargs.pop('alpha', 0.3)
+        # Plot the average trace
         ax.plot(time, average_trace, **kwargs)
-        ax.fill_between(time, c_int[0, :], c_int[1, :], alpha=0.3)
+
+        # Use fill_color for the confidence interval shading
+        ax.fill_between(time, c_int[0, :], c_int[1, :], color=fill_color, alpha=opacity)
 
         # plot the significant deflections
         y_height = ax.get_ylim()[1] * 0.97
@@ -832,3 +989,4 @@ class FiberPhotometryCollection:
         """
         with open(filename, 'rb') as f:
             return pickle.load(f)
+
